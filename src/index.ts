@@ -247,23 +247,6 @@ const tools: Tool[] = [
     },
   },
   {
-    name: "list_skills",
-    description:
-      "列出 skills 目录下所有可用的技能，返回技能名称和描述。在不确定有哪些技能可用时先调用此工具。",
-    parameters: {
-      type: "object",
-      properties: {},
-      required: [],
-    },
-    execute: async () => {
-      const skills = await listSkills();
-      if (skills.length === 0) return "当前没有可用技能。";
-      return skills
-        .map((s) => `- ${s.name}: ${s.description}`)
-        .join("\n");
-    },
-  },
-  {
     name: "load_skill",
     description:
       "加载指定技能的完整说明文档。调用后将获取该技能的详细工作流程和指令，Agent 应该在后续对话中遵循这些指令。",
@@ -372,7 +355,7 @@ async function runTurn(
   }
 }
 
-function buildSystemPrompt(): string {
+function buildSystemPrompt(skills: SkillMeta[]): string {
   const now = new Date();
   const dateStr = now.toLocaleDateString("zh-CN", {
     year: "numeric",
@@ -397,6 +380,10 @@ function buildSystemPrompt(): string {
   const homeDir = os.homedir();
   const cwd = process.cwd();
 
+  const skillLines = skills.length > 0
+    ? skills.map((s) => `- ${s.name}: ${s.description}`).join("\n")
+    : "(无可用技能)";
+
   return [
     "你是一个智能助手 Agent，可以使用工具来完成任务。\n",
     "### 环境信息",
@@ -406,16 +393,16 @@ function buildSystemPrompt(): string {
     `- 主机名: ${hostname}`,
     `- 用户目录: ${homeDir}`,
     `- 工作目录: ${cwd}\n`,
+    "### 可用技能",
+    "以下是已安装的技能，当用户需求匹配时直接调用 load_skill 加载:",
+    skillLines + "\n",
     "### 行为准则",
     "- 回答使用中文",
     "- 使用工具前先思考是否必要",
     "- 不确定时主动询问用户",
     "- 遇到错误时给出清晰的说明和解决建议\n",
-    "### 技能系统",
-    "当用户需求涉及特定领域时:",
-    "1. 调用 list_skills 查看可用技能",
-    "2. 调用 load_skill 加载匹配的技能",
-    "3. 严格遵循技能文档中的指令完成任务",
+    "### 技能使用方式",
+    "当用户的需求匹配某个可用技能时，直接调用 load_skill('<技能名>') 加载指令，然后严格遵循技能文档完成任务。无需先调用 list_skills。",
   ].join("\n");
 }
 
@@ -441,8 +428,10 @@ async function main() {
     process.exit(1);
   }
 
+  const installedSkills = await listSkills();
+
   function resetMessages(): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
-    return [{ role: "system", content: buildSystemPrompt() }];
+    return [{ role: "system", content: buildSystemPrompt(installedSkills) }];
   }
 
   const toolSchemas = buildToolSchemas();
