@@ -234,15 +234,27 @@ const tools: Tool[] = [
     },
     execute: async (args) => {
       const command = args.command as string;
+      const isWindows = process.platform === "win32";
+      const finalCommand = isWindows
+        ? `chcp 65001 >nul && ${command}`
+        : command;
       return new Promise((resolve) => {
-        exec(command, { timeout: 30000, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
-          if (err) {
-            resolve(`命令执行失败 (退出码 ${err.code}):\n${stderr || err.message}`);
-            return;
+        exec(
+          finalCommand,
+          { timeout: 30000, maxBuffer: 1024 * 1024, encoding: "buffer" },
+          (err, stdout, stderr) => {
+            const dec = (b: Buffer) => b.toString("utf8");
+            if (err) {
+              const msg = stderr.length > 0 ? dec(stderr as Buffer) : err.message;
+              resolve(`命令执行失败 (退出码 ${err.code}):\n${msg}`);
+              return;
+            }
+            const output = [dec(stdout as Buffer), dec(stderr as Buffer)]
+              .filter(Boolean)
+              .join("\n");
+            resolve(output || "(无输出)");
           }
-          const output = [stdout, stderr].filter(Boolean).join("\n");
-          resolve(output || "(无输出)");
-        });
+        );
       });
     },
   },
