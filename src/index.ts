@@ -1,7 +1,10 @@
+import "dotenv/config";
 import OpenAI from "openai";
 import * as readline from "node:readline";
 import * as fs from "node:fs/promises";
+import { existsSync } from "node:fs";
 import * as path from "node:path";
+import * as os from "node:os";
 import { exec } from "node:child_process";
 
 const client = new OpenAI({
@@ -10,12 +13,59 @@ const client = new OpenAI({
 });
 
 const MODEL = process.env.USER_LLM_MODEL || "gpt-4o-mini";
+const SKILLS_DIR = process.env.USER_SKILLS_DIR || path.resolve("./skills");
 
 interface Tool {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
   execute: (args: Record<string, unknown>) => Promise<string>;
+}
+
+interface SkillMeta {
+  name: string;
+  description: string;
+}
+
+function parseFrontMatter(raw: string): { meta: SkillMeta; body: string } {
+  const normalized = raw.replace(/\r\n/g, "\n");
+  const match = normalized.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+  if (!match) {
+    return { meta: { name: "", description: "" }, body: normalized };
+  }
+  const yamlBlock = match[1];
+  const body = match[2];
+
+  const nameMatch = yamlBlock.match(/^name:\s*(.+)$/m);
+  const descMatch = yamlBlock.match(/^description:\s*(.+)$/m);
+
+  return {
+    meta: {
+      name: nameMatch ? nameMatch[1].trim() : "",
+      description: descMatch ? descMatch[1].trim() : "",
+    },
+    body: body.trim(),
+  };
+}
+
+async function listSkills(): Promise<SkillMeta[]> {
+  if (!existsSync(SKILLS_DIR)) return [];
+
+  const entries = await fs.readdir(SKILLS_DIR, { withFileTypes: true });
+  const results: SkillMeta[] = [];
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const skillFile = path.join(SKILLS_DIR, entry.name, "SKILL.md");
+    try {
+      const raw = await fs.readFile(skillFile, "utf-8");
+      const { meta } = parseFrontMatter(raw);
+      results.push(meta);
+    } catch {
+      // skip unreadable skills
+    }
+  }
+  return results;
 }
 
 const tools: Tool[] = [
@@ -196,6 +246,50 @@ const tools: Tool[] = [
       });
     },
   },
+  {
+    name: "list_skills",
+    description:
+      "列出 skills 目录下所有可用的技能，返回技能名称和描述。在不确定有哪些技能可用时先调用此工具。",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+    execute: async () => {
+      const skills = await listSkills();
+      if (skills.length === 0) return "当前没有可用技能。";
+      return skills
+        .map((s) => `- ${s.name}: ${s.description}`)
+        .join("\n");
+    },
+  },
+  {
+    name: "load_skill",
+    description:
+      "加载指定技能的完整说明文档。调用后将获取该技能的详细工作流程和指令，Agent 应该在后续对话中遵循这些指令。",
+    parameters: {
+      type: "object",
+      properties: {
+        skillName: {
+          type: "string",
+          description: "技能名称，由 list_skills 返回的结果中获取",
+        },
+      },
+      required: ["skillName"],
+    },
+    execute: async (args) => {
+      const skillName = args.skillName as string;
+      const safeName = path.basename(skillName);
+      const skillFile = path.join(SKILLS_DIR, safeName, "SKILL.md");
+      try {
+        const raw = await fs.readFile(skillFile, "utf-8");
+        const { meta, body } = parseFrontMatter(raw);
+        return `[技能已加载: ${meta.name}]\n${meta.description}\n\n---\n\n${body}`;
+      } catch {
+        return `加载失败: 技能 "${skillName}" 不存在或无法读取 (查找路径: ${skillFile})`;
+      }
+    },
+  },
 ];
 
 function buildToolSchemas(): OpenAI.Chat.Completions.ChatCompletionTool[] {
@@ -213,13 +307,22 @@ async function runTurn(
   messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
   toolSchemas: OpenAI.Chat.Completions.ChatCompletionTool[]
 ) {
+  trimMessages(messages);
+
   while (true) {
-    const response = await client.chat.completions.create({
-      model: MODEL,
-      messages,
-      tools: toolSchemas,
-      tool_choice: "auto",
-    });
+    let response: OpenAI.Chat.Completions.ChatCompletion;
+    try {
+      response = await client.chat.completions.create({
+        model: MODEL,
+        messages,
+        tools: toolSchemas,
+        tool_choice: "auto",
+      });
+    } catch (err: any) {
+      const errMsg = err?.error?.message || err.message || String(err);
+      console.log(`Agent: [API 调用失败] ${errMsg}\n`);
+      break;
+    }
 
     const choice = response.choices[0];
     if (!choice) break;
@@ -269,6 +372,65 @@ async function runTurn(
   }
 }
 
+function buildSystemPrompt(): string {
+  const now = new Date();
+  const dateStr = now.toLocaleDateString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    weekday: "long",
+  });
+  const timeStr = now.toLocaleTimeString("zh-CN", { hour12: false });
+  const platform = os.platform();
+  const platformNames: Record<string, string> = {
+    aix: "AIX",
+    darwin: "macOS",
+    freebsd: "FreeBSD",
+    linux: "Linux",
+    openbsd: "OpenBSD",
+    sunos: "Solaris",
+    win32: "Windows",
+  };
+  const osName = platformNames[platform] || platform;
+  const arch = os.arch();
+  const hostname = os.hostname();
+  const homeDir = os.homedir();
+  const cwd = process.cwd();
+
+  return [
+    "你是一个智能助手 Agent，可以使用工具来完成任务。\n",
+    "### 环境信息",
+    `- 日期: ${dateStr}`,
+    `- 时间: ${timeStr}`,
+    `- 操作系统: ${osName} (${arch})`,
+    `- 主机名: ${hostname}`,
+    `- 用户目录: ${homeDir}`,
+    `- 工作目录: ${cwd}\n`,
+    "### 行为准则",
+    "- 回答使用中文",
+    "- 使用工具前先思考是否必要",
+    "- 不确定时主动询问用户",
+    "- 遇到错误时给出清晰的说明和解决建议\n",
+    "### 技能系统",
+    "当用户需求涉及特定领域时:",
+    "1. 调用 list_skills 查看可用技能",
+    "2. 调用 load_skill 加载匹配的技能",
+    "3. 严格遵循技能文档中的指令完成任务",
+  ].join("\n");
+}
+
+const MAX_MESSAGES = 50;
+
+function trimMessages(
+  messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]
+) {
+  if (messages.length <= MAX_MESSAGES) return;
+  const systemMsg = messages[0];
+  const keep = messages.slice(-(MAX_MESSAGES - 1));
+  messages.length = 0;
+  messages.push(systemMsg, ...keep);
+}
+
 async function main() {
   if (!process.env.USER_LLM_API_KEY) {
     console.error(
@@ -279,13 +441,12 @@ async function main() {
     process.exit(1);
   }
 
+  function resetMessages(): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
+    return [{ role: "system", content: buildSystemPrompt() }];
+  }
+
   const toolSchemas = buildToolSchemas();
-  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-    {
-      role: "system",
-      content: "你是一个智能助手，可以使用工具来回答问题。回答请使用中文。",
-    },
-  ];
+  let messages = resetMessages();
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -310,7 +471,7 @@ async function main() {
       break;
     }
     if (input.toLowerCase() === "clear") {
-      messages.length = 1;
+      messages = resetMessages();
       console.log("对话已清空\n");
       continue;
     }
