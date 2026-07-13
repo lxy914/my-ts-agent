@@ -1,3 +1,10 @@
+/**
+ * Simple Agent — 基于 OpenAI 兼容 API 的命令行 AI 助手
+ *
+ * 支持工具调用（时间、计算、文件读写、Shell 命令等）和技能系统（SKILL.md）。
+ * 使用方式: npx ts-node src/index.ts [初始问题]
+ */
+
 import "dotenv/config";
 import OpenAI from "openai";
 import * as readline from "node:readline";
@@ -7,6 +14,8 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { exec } from "node:child_process";
 
+// ─── 配置：从环境变量加载 ────────────────────────────────────────────────────
+
 const client = new OpenAI({
   baseURL: process.env.USER_LLM_BASE_URL || "https://api.openai.com/v1",
   apiKey: process.env.USER_LLM_API_KEY || "",
@@ -15,6 +24,9 @@ const client = new OpenAI({
 const MODEL = process.env.USER_LLM_MODEL || "gpt-4o-mini";
 const SKILLS_DIR = process.env.USER_SKILLS_DIR || path.resolve("./skills");
 
+// ─── 类型定义 ─────────────────────────────────────────────────────────────────
+
+/** Agent 可调用的工具 */
 interface Tool {
   name: string;
   description: string;
@@ -22,12 +34,26 @@ interface Tool {
   execute: (args: Record<string, unknown>) => Promise<string>;
 }
 
+/** 技能的元数据（从 SKILL.md 的 YAML front matter 解析） */
 interface SkillMeta {
   name: string;
   description: string;
 }
 
+// ─── 技能系统 ─────────────────────────────────────────────────────────────────
+
+/**
+ * 解析 SKILL.md 的 YAML front matter
+ *
+ * 格式示例:
+ *   ---
+ *   name: 代码审查
+ *   description: 对代码进行全面审查
+ *   ---
+ *   （正文内容）
+ */
 function parseFrontMatter(raw: string): { meta: SkillMeta; body: string } {
+  // 统一换行符，兼容 Windows 的 \r\n
   const normalized = raw.replace(/\r\n/g, "\n");
   const match = normalized.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
   if (!match) {
@@ -48,6 +74,9 @@ function parseFrontMatter(raw: string): { meta: SkillMeta; body: string } {
   };
 }
 
+/**
+ * 扫描 SKILLS_DIR 下所有子目录，读取每个 skill 的 SKILL.md 并提取元数据
+ */
 async function listSkills(): Promise<SkillMeta[]> {
   if (!existsSync(SKILLS_DIR)) return [];
 
@@ -62,13 +91,16 @@ async function listSkills(): Promise<SkillMeta[]> {
       const { meta } = parseFrontMatter(raw);
       results.push(meta);
     } catch {
-      // skip unreadable skills
+      // 跳过无法读取的技能
     }
   }
   return results;
 }
 
+// ─── 工具定义 ─────────────────────────────────────────────────────────────────
+
 const tools: Tool[] = [
+  // --- get_current_time ---
   {
     name: "get_current_time",
     description: "获取当前日期和时间",
@@ -81,6 +113,8 @@ const tools: Tool[] = [
       return new Date().toISOString();
     },
   },
+
+  // --- calculate ---
   {
     name: "calculate",
     description: "执行数学计算，支持加减乘除",
@@ -96,11 +130,14 @@ const tools: Tool[] = [
     },
     execute: async (args) => {
       const expr = args.expression as string;
+      // 过滤非法字符，防止代码注入
       const sanitized = expr.replace(/[^0-9+\-*/().%\s]/g, "");
       const result = Function(`"use strict"; return (${sanitized})`)();
       return String(result);
     },
   },
+
+  // --- read ---
   {
     name: "read",
     description:
@@ -143,6 +180,8 @@ const tools: Tool[] = [
       }
     },
   },
+
+  // --- write ---
   {
     name: "write",
     description:
@@ -166,6 +205,7 @@ const tools: Tool[] = [
       const content = args.content as string;
 
       try {
+        // 自动创建不存在的父目录
         await fs.mkdir(path.dirname(filePath), { recursive: true });
         await fs.writeFile(filePath, content, "utf-8");
         return `写入成功: ${filePath}`;
@@ -174,6 +214,8 @@ const tools: Tool[] = [
       }
     },
   },
+
+  // --- edit ---
   {
     name: "edit",
     description:
@@ -218,6 +260,8 @@ const tools: Tool[] = [
       }
     },
   },
+
+  // --- bash ---
   {
     name: "bash",
     description:
@@ -235,12 +279,14 @@ const tools: Tool[] = [
     execute: async (args) => {
       const command = args.command as string;
       const isWindows = process.platform === "win32";
+      // Windows 下强制切换编码页为 UTF-8，解决中文乱码问题
       const finalCommand = isWindows
         ? `chcp 65001 >nul && ${command}`
         : command;
       return new Promise((resolve) => {
         exec(
           finalCommand,
+          // encoding: "buffer" 获取原始字节，避免 Node.js 默认编码与系统编码不匹配
           { timeout: 30000, maxBuffer: 1024 * 1024, encoding: "buffer" },
           (err, stdout, stderr) => {
             const dec = (b: Buffer) => b.toString("utf8");
@@ -258,6 +304,8 @@ const tools: Tool[] = [
       });
     },
   },
+
+  // --- load_skill ---
   {
     name: "load_skill",
     description:
@@ -267,13 +315,14 @@ const tools: Tool[] = [
       properties: {
         skillName: {
           type: "string",
-          description: "技能名称，由 list_skills 返回的结果中获取",
+          description: "技能名称，与 system prompt 中列出的可用技能名称一致",
         },
       },
       required: ["skillName"],
     },
     execute: async (args) => {
       const skillName = args.skillName as string;
+      // 防止路径遍历攻击
       const safeName = path.basename(skillName);
       const skillFile = path.join(SKILLS_DIR, safeName, "SKILL.md");
       try {
@@ -287,6 +336,9 @@ const tools: Tool[] = [
   },
 ];
 
+// ─── 核心逻辑 ─────────────────────────────────────────────────────────────────
+
+/** 将工具数组转换为 OpenAI API 所需的 tool schema 格式 */
 function buildToolSchemas(): OpenAI.Chat.Completions.ChatCompletionTool[] {
   return tools.map((t) => ({
     type: "function" as const,
@@ -298,6 +350,11 @@ function buildToolSchemas(): OpenAI.Chat.Completions.ChatCompletionTool[] {
   }));
 }
 
+/**
+ * 执行一轮对话
+ *
+ * 调用 LLM，如果模型要求工具调用则执行工具并反馈结果，循环直到模型给出最终回复。
+ */
 async function runTurn(
   messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
   toolSchemas: OpenAI.Chat.Completions.ChatCompletionTool[]
@@ -324,12 +381,14 @@ async function runTurn(
 
     const { finish_reason, message } = choice;
 
+    // 模型完成回复
     if (finish_reason === "stop") {
       messages.push(message);
       console.log(`Agent: ${message.content}\n`);
       break;
     }
 
+    // 模型要求调用工具
     if (finish_reason === "tool_calls" && message.tool_calls) {
       messages.push(message);
 
@@ -358,15 +417,18 @@ async function runTurn(
           content: result,
         });
       }
+      // 返回循环，让模型根据工具结果继续思考
       continue;
     }
 
+    // 其他情况（如 length 限制等），直接输出
     messages.push(message);
     console.log(`Agent: ${message.content || "(无响应)"}\n`);
     break;
   }
 }
 
+/** 构建 system prompt，包含环境信息和可用技能列表 */
 function buildSystemPrompt(skills: SkillMeta[]): string {
   const now = new Date();
   const dateStr = now.toLocaleDateString("zh-CN", {
@@ -418,8 +480,14 @@ function buildSystemPrompt(skills: SkillMeta[]): string {
   ].join("\n");
 }
 
+/** 消息数量上限，超过时裁剪以控制 token 消耗 */
 const MAX_MESSAGES = 50;
 
+/**
+ * 裁剪消息列表，保留 system prompt + 最近的消息
+ *
+ * 防止对话历史过长导致超出模型上下文窗口。
+ */
 function trimMessages(
   messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]
 ) {
@@ -430,6 +498,7 @@ function trimMessages(
   messages.push(systemMsg, ...keep);
 }
 
+/** 程序入口 */
 async function main() {
   if (!process.env.USER_LLM_API_KEY) {
     console.error(
@@ -440,8 +509,10 @@ async function main() {
     process.exit(1);
   }
 
+  // 启动时预加载所有技能，注入到 system prompt
   const installedSkills = await listSkills();
 
+  /** 重置消息列表为仅含 system prompt */
   function resetMessages(): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
     return [{ role: "system", content: buildSystemPrompt(installedSkills) }];
   }
@@ -449,6 +520,7 @@ async function main() {
   const toolSchemas = buildToolSchemas();
   let messages = resetMessages();
 
+  // 创建 REPL 接口
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -459,12 +531,14 @@ async function main() {
   const ask = (): Promise<string> =>
     new Promise((resolve) => rl.question("用户: ", resolve));
 
+  // 支持命令行参数作为初始问题
   const initMessage = process.argv.slice(2).join(" ");
   if (initMessage) {
     messages.push({ role: "user", content: initMessage });
     await runTurn(messages, toolSchemas);
   }
 
+  // 交互循环
   while (true) {
     const input = await ask();
     if (["exit", "quit"].includes(input.toLowerCase())) {
@@ -472,6 +546,7 @@ async function main() {
       break;
     }
     if (input.toLowerCase() === "clear") {
+      // 清空对话历史，重新生成 system prompt（刷新日期时间）
       messages = resetMessages();
       console.log("对话已清空\n");
       continue;
