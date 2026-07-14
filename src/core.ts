@@ -24,6 +24,14 @@ import type { SkillMeta } from "./types";
 const MAX_MESSAGES = 50;
 
 /**
+ * 工具结果终端展示的最大字符数
+ *
+ * 过长的输出会在控制台刷屏，影响阅读体验。
+ * 截断只影响终端显示，完整结果仍然会传给 LLM（LLM 需要完整信息）。
+ */
+const MAX_TOOL_DISPLAY = 500;
+
+/**
  * 将内部工具数组转换为 OpenAI API 要求的格式
  *
  * OpenAI 的 tool schema 格式和我们内部 Tool 接口几乎一样，
@@ -134,7 +142,14 @@ export async function runTurn(
 
         // 执行工具，获取结果
         const result = await tool.execute(args);
-        console.log(`[工具结果] ${result}`);
+        // 终端展示时截断过长的结果，避免刷屏
+        // 但传给 LLM 的是完整结果，不截断（LLM 需要完整信息才能正确回复）
+        const displayResult =
+          result.length > MAX_TOOL_DISPLAY
+            ? result.slice(0, MAX_TOOL_DISPLAY) +
+              `\n...（已截断，共 ${result.length} 字符）`
+            : result;
+        console.log(`[工具结果] ${displayResult}`);
 
         // 把工具结果以 "tool" 角色添加到对话历史中
         // 这样 LLM 在下一轮就能看到工具的输出
